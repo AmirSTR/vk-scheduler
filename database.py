@@ -29,6 +29,13 @@ class Database:
                     created_at  TEXT DEFAULT (datetime('now'))
                 )
             ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id  INTEGER PRIMARY KEY,
+                    name     TEXT NOT NULL DEFAULT '',
+                    added_at TEXT DEFAULT (datetime('now'))
+                )
+            ''')
 
     def add_task(self, message: str, peer_id: int, next_run: str,
                  repeat_type: str, repeat_value: str) -> int:
@@ -60,3 +67,25 @@ class Database:
     def update_next_run(self, task_id: int, next_run: str):
         with self._conn() as conn:
             conn.execute('UPDATE tasks SET next_run=? WHERE id=?', (next_run, task_id))
+
+    def add_admin(self, user_id: int, name: str):
+        with self._conn() as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO admins (user_id, name) VALUES (?,?)',
+                (user_id, name),
+            )
+
+    def remove_admin(self, user_id: int):
+        with self._conn() as conn:
+            conn.execute('DELETE FROM admins WHERE user_id=?', (user_id,))
+
+    def get_all_admins(self) -> List[dict]:
+        with self._conn() as conn:
+            rows = conn.execute('SELECT * FROM admins ORDER BY added_at').fetchall()
+            return [dict(r) for r in rows]
+
+    def is_admin(self, user_id: int) -> bool:
+        with self._conn() as conn:
+            return conn.execute(
+                'SELECT 1 FROM admins WHERE user_id=?', (user_id,)
+            ).fetchone() is not None

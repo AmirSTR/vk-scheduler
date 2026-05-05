@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS = range(5)
+WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS, WAIT_ADMIN_ID = range(6)
 
 db = Database()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -33,20 +33,29 @@ vk = vk_session.get_api()
 tg_app = None
 user_chat_id = ALLOWED_USER_ID if ALLOWED_USER_ID else None
 
-MAIN_KB = ReplyKeyboardMarkup([
-    [KeyboardButton("📝 Новая задача"), KeyboardButton("📋 Мои задачи")],
-    [KeyboardButton("⏸ Пауза"),          KeyboardButton("▶️ Возобновить")],
-    [KeyboardButton("🗑 Удалить задачу")],
-], resize_keyboard=True)
-
 CANCEL_KB = ReplyKeyboardMarkup(
     [[KeyboardButton("❌ Отмена")]],
     resize_keyboard=True,
 )
 
 
+def is_super_admin(user_id: int) -> bool:
+    return ALLOWED_USER_ID != 0 and user_id == ALLOWED_USER_ID
+
+
 def check_auth(user_id: int) -> bool:
-    return ALLOWED_USER_ID == 0 or user_id == ALLOWED_USER_ID
+    return ALLOWED_USER_ID == 0 or is_super_admin(user_id) or db.is_admin(user_id)
+
+
+def get_kb(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("📝 Новая задача"), KeyboardButton("📋 Мои задачи")],
+        [KeyboardButton("⏸ Пауза"),          KeyboardButton("▶️ Возобновить")],
+        [KeyboardButton("🗑 Удалить задачу")],
+    ]
+    if is_super_admin(user_id):
+        rows[-1].append(KeyboardButton("👥 Администраторы"))
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 async def send_vk_message(peer_id: int, message: str) -> bool:
@@ -193,14 +202,23 @@ def _task_confirmation(task_id, data, repeat_type, repeat_value) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global user_chat_id
-    if not check_auth(update.effective_user.id):
+    user = update.effective_user
+    if not check_auth(user.id):
+        await update.message.reply_text(
+            f"🔒 У вас нет доступа к этому боту.\n\n"
+            f"Ваш Telegram ID: `{user.id}`\n"
+            f"Отправьте его владельцу бота для получения доступа.",
+            parse_mode='Markdown',
+        )
         return
     user_chat_id = update.effective_chat.id
+    if db.is_admin(user.id):
+        db.add_admin(user.id, user.full_name or '')
     context.user_data.clear()
     await update.message.reply_text(
         "👋 Привет! Я бот-планировщик сообщений для ВКонтакте.\n"
         "Используй кнопки ниже для управления задачами.",
-        reply_markup=MAIN_KB,
+        reply_markup=get_kb(user.id),
     )
 
 
@@ -219,7 +237,7 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Создание задачи отменено.", reply_markup=MAIN_KB)
+    await update.message.reply_text("❌ Отменено.", reply_markup=get_kb(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -344,7 +362,7 @@ async def _save_task_from_query(query, context, repeat_type, repeat_value):
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(
         _task_confirmation(task_id, data, repeat_type, repeat_value),
-        reply_markup=MAIN_KB,
+        reply_markup=get_kb(query.from_user.id),
     )
 
 
@@ -360,7 +378,7 @@ async def _save_task_from_message(update, context, repeat_type, repeat_value):
     schedule_job(db.get_task(task_id))
     await update.message.reply_text(
         _task_confirmation(task_id, data, repeat_type, repeat_value),
-        reply_markup=MAIN_KB,
+        reply_markup=get_kb(update.effective_user.id),
     )
 
 
@@ -371,14 +389,14 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tasks = db.get_all_tasks()
     if not tasks:
-        await update.message.reply_text("📭 Нет запланированных задач.", reply_markup=MAIN_KB)
+        await update.message.reply_text("📭 Нет запланированных задач.", reply_markup=get_kb(update.effective_user.id))
         return
 
     active = sum(1 for t in tasks if not t['paused'])
     paused = len(tasks) - active
     await update.message.reply_text(
         f"📋 Задач всего: {len(tasks)}  (▶️ активных: {active} / ⏸ на паузе: {paused})",
-        reply_markup=MAIN_KB,
+        reply_markup=get_kb(update.effective_user.id),
     )
     for t in tasks:
         await update.message.reply_text(_task_card_text(t), reply_markup=_task_card_kb(t))
@@ -469,7 +487,7 @@ async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tasks = db.get_all_tasks()
     if not tasks:
-        await update.message.reply_text("📭 Нет задач для удаления.", reply_markup=MAIN_KB)
+        await update.message.reply_text("📭 Нет задач для удаления.", reply_markup=get_kb(update.effective_user.id))
         return
     kb = [[InlineKeyboardButton(f"#{t['id']} {t['message'][:28]}", callback_data=f"task_del_ask:{t['id']}")] for t in tasks]
     await update.message.reply_text("Выбери задачу для удаления:", reply_markup=InlineKeyboardMarkup(kb))
@@ -480,7 +498,7 @@ async def pause_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tasks = [t for t in db.get_all_tasks() if not t['paused']]
     if not tasks:
-        await update.message.reply_text("Нет активных задач.", reply_markup=MAIN_KB)
+        await update.message.reply_text("Нет активных задач.", reply_markup=get_kb(update.effective_user.id))
         return
     kb = [[InlineKeyboardButton(f"#{t['id']} {t['message'][:28]}", callback_data=f"task_pause:{t['id']}")] for t in tasks]
     await update.message.reply_text("Выбери задачу для паузы:", reply_markup=InlineKeyboardMarkup(kb))
@@ -491,10 +509,93 @@ async def resume_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tasks = [t for t in db.get_all_tasks() if t['paused']]
     if not tasks:
-        await update.message.reply_text("Нет приостановленных задач.", reply_markup=MAIN_KB)
+        await update.message.reply_text("Нет приостановленных задач.", reply_markup=get_kb(update.effective_user.id))
         return
     kb = [[InlineKeyboardButton(f"#{t['id']} {t['message'][:28]}", callback_data=f"task_resume:{t['id']}")] for t in tasks]
     await update.message.reply_text("Выбери задачу для возобновления:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+# ── /myid ─────────────────────────────────────────────────────────────────────
+
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if db.is_admin(user.id):
+        db.add_admin(user.id, user.full_name or '')
+    await update.message.reply_text(
+        f"👤 Ваш Telegram ID: `{user.id}`\n"
+        f"Имя: {user.full_name or '—'}",
+        parse_mode='Markdown',
+    )
+
+
+# ── Admin management ──────────────────────────────────────────────────────────
+
+def _admins_panel():
+    admins = db.get_all_admins()
+    if not admins:
+        text = "👥 Администраторов пока нет."
+    else:
+        lines = [f"👥 Администраторы ({len(admins)} чел.)\n"]
+        for a in admins:
+            label = f"{a['name']} (ID: {a['user_id']})" if a['name'] else str(a['user_id'])
+            lines.append(f"• {label}")
+        text = '\n'.join(lines)
+
+    kb = []
+    for a in admins:
+        label = a['name'] or str(a['user_id'])
+        kb.append([InlineKeyboardButton(f"❌ Убрать: {label}", callback_data=f"admin_rm:{a['user_id']}")])
+    kb.append([InlineKeyboardButton("➕ Добавить администратора", callback_data="admin_add")])
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def admins_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_super_admin(update.effective_user.id):
+        return
+    text, kb = _admins_panel()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_super_admin(query.from_user.id):
+        return
+    user_id = int(query.data.split(':')[1])
+    db.remove_admin(user_id)
+    text, kb = _admins_panel()
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_super_admin(query.from_user.id):
+        return ConversationHandler.END
+    await query.message.reply_text(
+        "Введи Telegram ID пользователя, которого хочешь добавить.\n\n"
+        "Попроси его написать /myid в этом боте и прислать тебе цифры.",
+        reply_markup=CANCEL_KB,
+    )
+    return WAIT_ADMIN_ID
+
+
+async def admin_add_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_super_admin(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        new_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом. Попробуй ещё раз:")
+        return WAIT_ADMIN_ID
+    db.add_admin(new_id, '')
+    await update.message.reply_text(
+        f"✅ Пользователь `{new_id}` добавлен как администратор.\n"
+        f"Теперь он может использовать бота.",
+        parse_mode='Markdown',
+        reply_markup=get_kb(update.effective_user.id),
+    )
+    return ConversationHandler.END
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -528,25 +629,44 @@ def main():
         per_message=False,
     )
 
-    tg_app.add_handler(CommandHandler('start', start))
+    admin_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_add_start, pattern='^admin_add$'),
+        ],
+        states={
+            WAIT_ADMIN_ID: [MessageHandler(text_no_cmd, admin_add_finish)],
+        },
+        fallbacks=[
+            CommandHandler('start', start),
+            MessageHandler(cancel_filter, cancel_conv),
+        ],
+        per_message=False,
+    )
+
+    tg_app.add_handler(CommandHandler('start',   start))
+    tg_app.add_handler(CommandHandler('myid',    my_id))
     tg_app.add_handler(add_conv)
-    tg_app.add_handler(CommandHandler('list',   list_tasks))
-    tg_app.add_handler(CommandHandler('delete', delete_task))
-    tg_app.add_handler(CommandHandler('pause',  pause_task))
-    tg_app.add_handler(CommandHandler('resume', resume_task))
+    tg_app.add_handler(admin_conv)
+    tg_app.add_handler(CommandHandler('list',    list_tasks))
+    tg_app.add_handler(CommandHandler('delete',  delete_task))
+    tg_app.add_handler(CommandHandler('pause',   pause_task))
+    tg_app.add_handler(CommandHandler('resume',  resume_task))
+    tg_app.add_handler(CommandHandler('admins',  admins_panel))
 
     # Reply-keyboard button handlers
-    tg_app.add_handler(MessageHandler(filters.Regex('^📋 Мои задачи$'),    list_tasks))
-    tg_app.add_handler(MessageHandler(filters.Regex('^⏸ Пауза$'),          pause_task))
-    tg_app.add_handler(MessageHandler(filters.Regex('^▶️ Возобновить$'),    resume_task))
-    tg_app.add_handler(MessageHandler(filters.Regex('^🗑 Удалить задачу$'), delete_task))
+    tg_app.add_handler(MessageHandler(filters.Regex('^📋 Мои задачи$'),       list_tasks))
+    tg_app.add_handler(MessageHandler(filters.Regex('^⏸ Пауза$'),             pause_task))
+    tg_app.add_handler(MessageHandler(filters.Regex('^▶️ Возобновить$'),       resume_task))
+    tg_app.add_handler(MessageHandler(filters.Regex('^🗑 Удалить задачу$'),    delete_task))
+    tg_app.add_handler(MessageHandler(filters.Regex('^👥 Администраторы$'),    admins_panel))
 
     # Inline-button handlers
-    tg_app.add_handler(CallbackQueryHandler(task_pause,   pattern='^task_pause:'))
-    tg_app.add_handler(CallbackQueryHandler(task_resume,  pattern='^task_resume:'))
-    tg_app.add_handler(CallbackQueryHandler(task_del_ask, pattern='^task_del_ask:'))
-    tg_app.add_handler(CallbackQueryHandler(task_del_yes, pattern='^task_del_yes:'))
-    tg_app.add_handler(CallbackQueryHandler(task_del_no,  pattern='^task_del_no:'))
+    tg_app.add_handler(CallbackQueryHandler(task_pause,    pattern='^task_pause:'))
+    tg_app.add_handler(CallbackQueryHandler(task_resume,   pattern='^task_resume:'))
+    tg_app.add_handler(CallbackQueryHandler(task_del_ask,  pattern='^task_del_ask:'))
+    tg_app.add_handler(CallbackQueryHandler(task_del_yes,  pattern='^task_del_yes:'))
+    tg_app.add_handler(CallbackQueryHandler(task_del_no,   pattern='^task_del_no:'))
+    tg_app.add_handler(CallbackQueryHandler(admin_remove,  pattern='^admin_rm:'))
 
     async def on_startup(app):
         tasks = db.get_all_tasks()
