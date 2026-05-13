@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import random
 from datetime import datetime, timedelta
 from telegram import (
@@ -22,7 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS, WAIT_ADMIN_ID = range(6)
+(WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE,
+ WAIT_REPEAT_HOURS, WAIT_ADMIN_ID, WAIT_CHAT_PEER_ID, WAIT_CHAT_NAME) = range(8)
 
 db = Database()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -33,11 +36,51 @@ vk = vk_session.get_api()
 tg_app = None
 user_chat_id = ALLOWED_USER_ID if ALLOWED_USER_ID else None
 
+VK_CHATS_FILE = os.path.join(os.path.dirname(__file__), 'data', 'vk_chats.json')
+
 CANCEL_KB = ReplyKeyboardMarkup(
     [[KeyboardButton("❌ Отмена")]],
     resize_keyboard=True,
 )
 
+DAYS_RU = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+
+
+# ── VK chats (JSON storage) ────────────────────────────────────────────
+
+def _load_chats() -> list:
+    os.makedirs(os.path.dirname(VK_CHATS_FILE), exist_ok=True)
+    if not os.path.exists(VK_CHATS_FILE):
+        return []
+    try:
+        with open(VK_CHATS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _save_chats(chats: list):
+    os.makedirs(os.path.dirname(VK_CHATS_FILE), exist_ok=True)
+    with open(VK_CHATS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(chats, f, ensure_ascii=False, indent=2)
+
+
+def _add_chat(peer_id: int, title: str):
+    chats = [c for c in _load_chats() if c['peer_id'] != peer_id]
+    chats.append({'peer_id': peer_id, 'title': title})
+    _save_chats(chats)
+
+
+def _remove_chat(peer_id: int):
+    _save_chats([c for c in _load_chats() if c['peer_id'] != peer_id])
+
+
+def _peer_label(peer_id: int) -> str:
+    chat = next((c for c in _load_chats() if c['peer_id'] == peer_id), None)
+    return f"{chat['title']} ({peer_id})" if chat else str(peer_id)
+
+
+# ── auth & keyboard ────────────────────────────────────────────────────
 
 def is_super_admin(user_id: int) -> bool:
     return ALLOWED_USER_ID != 0 and user_id == ALLOWED_USER_ID
@@ -51,12 +94,14 @@ def get_kb(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton("📝 Новая задача"), KeyboardButton("📋 Мои задачи")],
         [KeyboardButton("⏸ Пауза"),          KeyboardButton("▶️ Возобновить")],
-        [KeyboardButton("🗑 Удалить задачу")],
+        [KeyboardButton("🗑 Удалить задачу"), KeyboardButton("💬 VK Чаты")],
     ]
     if is_super_admin(user_id):
-        rows[-1].append(KeyboardButton("👥 Администраторы"))
+        rows.append([KeyboardButton("👥 Администраторы")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
+
+# ── VK & scheduler ────────────────────────────────────────────────
 
 async def send_vk_message(peer_id: int, message: str) -> bool:
     try:
@@ -86,7 +131,7 @@ def schedule_job(task: dict):
                     text=(
                         f"{icon} Задача #{task['id']} — {verb}\n"
                         f"📨 {task['message'][:60]}\n"
-                        f"📬 peer_id: {task['peer_id']}"
+                        f"📬 {_peer_label(task['peer_id'])}"
                     ),
                 )
             except Exception as e:
@@ -95,30 +140,29 @@ def schedule_job(task: dict):
             db.delete_task(task['id'])
 
     if task['repeat_type'] == 'once':
-        run_date = datetime.fromisoformat(task['next_run'])
-        scheduler.add_job(job_func, 'date', run_date=run_date, id=job_id, replace_existing=True)
-
-    elif task['repeat_type'] == 'interval':
-        minutes = int(task['repeat_value'])
         scheduler.add_job(
-            job_func, IntervalTrigger(minutes=minutes),
+            job_func, 'date',
+            run_date=datetime.fromisoformat(task['next_run']),
+            id=job_id, replace_existing=True,
+        )
+    elif task['repeat_type'] == 'interval':
+        scheduler.add_job(
+            job_func, IntervalTrigger(minutes=int(task['repeat_value'])),
             id=job_id, replace_existing=True,
             next_run_time=datetime.fromisoformat(task['next_run']),
         )
-
     elif task['repeat_type'] == 'daily':
         hour, minute = task['repeat_value'].split(':')
         scheduler.add_job(
             job_func, CronTrigger(hour=int(hour), minute=int(minute), timezone="Europe/Moscow"),
             id=job_id, replace_existing=True,
         )
-
     elif task['repeat_type'] == 'weekly':
-        day, hour, minute = task['repeat_value'].split(':')
+        # repeat_value: 'days:HH:MM'  where days = '0' or '0,2,4'
+        day_str, hour, minute = task['repeat_value'].split(':')
         scheduler.add_job(
-            job_func, CronTrigger(
-                day_of_week=int(day), hour=int(hour), minute=int(minute), timezone="Europe/Moscow"
-            ),
+            job_func,
+            CronTrigger(day_of_week=day_str, hour=int(hour), minute=int(minute), timezone="Europe/Moscow"),
             id=job_id, replace_existing=True,
         )
 
@@ -131,38 +175,34 @@ def repeat_label(repeat_type, repeat_value):
     if repeat_type == 'daily':
         return f'Каждый день в {repeat_value}'
     if repeat_type == 'weekly':
-        days = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
-        parts = repeat_value.split(':')
-        return f'Каждую неделю {days[int(parts[0])]} в {parts[1]}:{parts[2]}'
+        day_str, h, m = repeat_value.split(':')
+        names = ', '.join(DAYS_RU[int(d)] for d in day_str.split(','))
+        return f'Каждую неделю: {names} в {h}:{m}'
     return repeat_value
 
 
 def parse_datetime(text: str) -> datetime | None:
-    """Accept 'сегодня HH:MM', 'завтра HH:MM', or 'DD.MM.YYYY HH:MM'."""
     text = text.strip().lower()
     now = datetime.now()
-
     if text.startswith('сегодня '):
         try:
-            t = datetime.strptime(text[len('сегодня '):], '%H:%M')
+            t = datetime.strptime(text[8:], '%H:%M')
             return now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
         except ValueError:
             return None
-
     if text.startswith('завтра '):
         try:
-            t = datetime.strptime(text[len('завтра '):], '%H:%M')
+            t = datetime.strptime(text[7:], '%H:%M')
             return (now + timedelta(days=1)).replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
         except ValueError:
             return None
-
     try:
         return datetime.strptime(text, '%d.%m.%Y %H:%M')
     except ValueError:
         return None
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────
 
 def _fmt_dt(iso: str) -> str:
     return datetime.fromisoformat(iso).strftime('%d.%m.%Y %H:%M')
@@ -173,7 +213,7 @@ def _task_card_text(t: dict) -> str:
     return (
         f"{'⏸' if t['paused'] else '▶️'} Задача #{t['id']} — {status}\n"
         f"📨 {t['message'][:80]}\n"
-        f"📬 peer_id: {t['peer_id']}\n"
+        f"📬 {_peer_label(t['peer_id'])}\n"
         f"🕐 Следующий запуск: {_fmt_dt(t['next_run'])}\n"
         f"🔄 {repeat_label(t['repeat_type'], t['repeat_value'])}"
     )
@@ -192,13 +232,27 @@ def _task_confirmation(task_id, data, repeat_type, repeat_value) -> str:
     return (
         f"✅ Задача #{task_id} создана!\n\n"
         f"📨 Сообщение: {data['message'][:50]}\n"
-        f"📬 peer_id: {data['peer_id']}\n"
+        f"📬 {_peer_label(data['peer_id'])}\n"
         f"🕐 Первая отправка: {_fmt_dt(data['next_run'])}\n"
         f"🔄 Повтор: {repeat_label(repeat_type, repeat_value)}"
     )
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+def _days_keyboard(selected: list) -> InlineKeyboardMarkup:
+    row1, row2 = [], []
+    for i, name in enumerate(DAYS_RU):
+        mark = "✅" if i in selected else "☐"
+        btn = InlineKeyboardButton(f"{mark} {name}", callback_data=f"mday:{i}")
+        (row1 if i < 4 else row2).append(btn)
+    if selected:
+        done_label = f"Готово ({len(selected)} дн.) ➡️"
+    else:
+        done_label = "Выбери хотя бы один день"
+    row3 = [InlineKeyboardButton(done_label, callback_data="mday_done")]
+    return InlineKeyboardMarkup([row1, row2, row3])
+
+
+# ── /start ──────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global user_chat_id
@@ -222,7 +276,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── /add conversation ─────────────────────────────────────────────────────────
+# ── /add conversation ─────────────────────────────────────────────────────
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
@@ -243,16 +297,48 @@ async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['message'] = update.message.text
-    await update.message.reply_text(
-        "📬 Введи peer_id чата ВК\n\n"
-        "• Беседа: число из ссылки + 2 000 000 000\n"
-        "  /convo/4 → peer_id = 2000000004\n"
-        "• Личка: ID пользователя (например: 123456)\n"
-        "• Группа: −ID группы (например: −987654)\n\n"
-        "Введи peer_id:",
+    chats = _load_chats()
+    if chats:
+        kb = [[InlineKeyboardButton(c['title'], callback_data=f"chat_sel:{c['peer_id']}")] for c in chats]
+        kb.append([InlineKeyboardButton("✏️ Ввести peer_id вручную", callback_data="chat_sel:manual")])
+        await update.message.reply_text("📬 Куда отправить?", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.message.reply_text(
+            "📬 Введи peer_id чата ВК\n\n"
+            "• Беседа: /convo/4 → 2000000004\n"
+            "• Личка: ID пользователя\n"
+            "• Группа: −ID группы\n\n"
+            "Чтобы не вводить каждый раз, сохрани чат через кнопку 💬 VK Чаты",
+            reply_markup=CANCEL_KB,
+        )
+    return WAIT_PEER_ID
+
+
+async def add_peer_id_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(':', 1)[1]
+    if value == 'manual':
+        await query.edit_message_text(
+            "📬 Введи peer_id чата ВК\n\n"
+            "• Беседа: /convo/4 → 2000000004\n"
+            "• Личка: ID пользователя\n"
+            "• Группа: −ID группы"
+        )
+        return WAIT_PEER_ID
+    peer_id = int(value)
+    context.user_data['peer_id'] = peer_id
+    chat = next((c for c in _load_chats() if c['peer_id'] == peer_id), None)
+    await query.edit_message_text(f"📬 Выбрано: {chat['title'] if chat else peer_id}")
+    await query.message.reply_text(
+        "🕐 Введи дату и время первой отправки:\n\n"
+        "• сегодня 14:30\n"
+        "• завтра 09:00\n"
+        "• 25.04.2026 14:30\n\n"
+        "Время московское (МСК).",
         reply_markup=CANCEL_KB,
     )
-    return WAIT_PEER_ID
+    return WAIT_DATETIME
 
 
 async def add_peer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -261,7 +347,6 @@ async def add_peer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ peer_id должен быть числом. Попробуй ещё раз:")
         return WAIT_PEER_ID
-
     await update.message.reply_text(
         "🕐 Введи дату и время первой отправки:\n\n"
         "• сегодня 14:30\n"
@@ -283,13 +368,12 @@ async def add_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 25.04.2026 14:30"
         )
         return WAIT_DATETIME
-
     context.user_data['next_run'] = dt.isoformat()
     keyboard = [
         [InlineKeyboardButton("🔂 Раз (без повтора)",        callback_data="repeat:once")],
         [InlineKeyboardButton("🔁 Каждые N минут",           callback_data="repeat:interval")],
         [InlineKeyboardButton("📅 Каждый день в это время",  callback_data="repeat:daily")],
-        [InlineKeyboardButton("📆 Раз в неделю",             callback_data="repeat:weekly")],
+        [InlineKeyboardButton("📆 По дням недели",           callback_data="repeat:weekly")],
     ]
     await update.message.reply_text("🔄 Выбери режим повтора:", reply_markup=InlineKeyboardMarkup(keyboard))
     return WAIT_REPEAT_CHOICE
@@ -315,17 +399,41 @@ async def add_repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if repeat_type == 'weekly':
-        days_kb = [
-            [InlineKeyboardButton("Пн", callback_data="day:0"),
-             InlineKeyboardButton("Вт", callback_data="day:1"),
-             InlineKeyboardButton("Ср", callback_data="day:2"),
-             InlineKeyboardButton("Чт", callback_data="day:3")],
-            [InlineKeyboardButton("Пт", callback_data="day:4"),
-             InlineKeyboardButton("Сб", callback_data="day:5"),
-             InlineKeyboardButton("Вс", callback_data="day:6")],
-        ]
-        await query.edit_message_text("Выбери день недели:", reply_markup=InlineKeyboardMarkup(days_kb))
+        context.user_data['selected_days'] = []
+        await query.edit_message_text(
+            "📆 Выбери дни недели (можно несколько):",
+            reply_markup=_days_keyboard([]),
+        )
         return WAIT_REPEAT_CHOICE
+
+
+async def add_weekday_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    day = int(query.data.split(':')[1])
+    selected = context.user_data.get('selected_days', [])
+    if day in selected:
+        selected.remove(day)
+    else:
+        selected.append(day)
+    context.user_data['selected_days'] = selected
+    await query.edit_message_reply_markup(reply_markup=_days_keyboard(selected))
+    return WAIT_REPEAT_CHOICE
+
+
+async def add_weekday_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    selected = context.user_data.get('selected_days', [])
+    if not selected:
+        await query.answer("Выбери хотя бы один день!", show_alert=True)
+        return WAIT_REPEAT_CHOICE
+    await query.answer()
+    selected.sort()
+    dt = datetime.fromisoformat(context.user_data['next_run'])
+    day_str = ','.join(str(d) for d in selected)
+    repeat_value = f"{day_str}:{dt.hour:02d}:{dt.minute:02d}"
+    await _save_task_from_query(query, context, 'weekly', repeat_value)
+    return ConversationHandler.END
 
 
 async def add_repeat_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,15 +445,6 @@ async def add_repeat_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Введи целое число минут (например: 60):")
         return WAIT_REPEAT_HOURS
     await _save_task_from_message(update, context, 'interval', str(minutes))
-    return ConversationHandler.END
-
-
-async def add_weekday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    day = query.data.split(':')[1]
-    dt = datetime.fromisoformat(context.user_data['next_run'])
-    await _save_task_from_query(query, context, 'weekly', f"{day}:{dt.hour:02d}:{dt.minute:02d}")
     return ConversationHandler.END
 
 
@@ -382,7 +481,7 @@ async def _save_task_from_message(update, context, repeat_type, repeat_value):
     )
 
 
-# ── /list ─────────────────────────────────────────────────────────────────────
+# ── /list ─────────────────────────────────────────────────────────────────
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
@@ -391,7 +490,6 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tasks:
         await update.message.reply_text("📭 Нет запланированных задач.", reply_markup=get_kb(update.effective_user.id))
         return
-
     active = sum(1 for t in tasks if not t['paused'])
     paused = len(tasks) - active
     await update.message.reply_text(
@@ -402,7 +500,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_task_card_text(t), reply_markup=_task_card_kb(t))
 
 
-# ── task card inline actions ──────────────────────────────────────────────────
+# ── task card inline actions ──────────────────────────────────────────────
 
 async def task_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -413,9 +511,8 @@ async def task_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Задача не найдена.")
         return
     db.set_paused(task_id, True)
-    job_id = f"task_{task_id}"
-    if scheduler.get_job(job_id):
-        scheduler.pause_job(job_id)
+    if scheduler.get_job(f"task_{task_id}"):
+        scheduler.pause_job(f"task_{task_id}")
     updated = {**task, 'paused': 1}
     await query.edit_message_text(_task_card_text(updated), reply_markup=_task_card_kb(updated))
 
@@ -480,7 +577,7 @@ async def task_del_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(_task_card_text(task), reply_markup=_task_card_kb(task))
 
 
-# ── /delete /pause /resume (keyboard-button entry points) ────────────────────
+# ── /delete /pause /resume (keyboard-button entry points) ────────────────
 
 async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
@@ -515,7 +612,7 @@ async def resume_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выбери задачу для возобновления:", reply_markup=InlineKeyboardMarkup(kb))
 
 
-# ── /myid ─────────────────────────────────────────────────────────────────────
+# ── /myid ─────────────────────────────────────────────────────────────────
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -528,7 +625,7 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Admin management ──────────────────────────────────────────────────────────
+# ── Admin management ────────────────────────────────────────────────────────
 
 def _admins_panel():
     admins = db.get_all_admins()
@@ -540,11 +637,11 @@ def _admins_panel():
             label = f"{a['name']} (ID: {a['user_id']})" if a['name'] else str(a['user_id'])
             lines.append(f"• {label}")
         text = '\n'.join(lines)
-
     kb = []
     for a in admins:
         label = a['name'] or str(a['user_id'])
-        kb.append([InlineKeyboardButton(f"❌ Убрать: {label}", callback_data=f"admin_rm:{a['user_id']}")])
+        kb.append([InlineKeyboardButton(f"❌ Убрать: {label}", callback_data=f"admin_rm:{a['user_id']}")
+])
     kb.append([InlineKeyboardButton("➕ Добавить администратора", callback_data="admin_add")])
     return text, InlineKeyboardMarkup(kb)
 
@@ -561,8 +658,7 @@ async def admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_super_admin(query.from_user.id):
         return
-    user_id = int(query.data.split(':')[1])
-    db.remove_admin(user_id)
+    db.remove_admin(int(query.data.split(':')[1]))
     text, kb = _admins_panel()
     await query.edit_message_text(text, reply_markup=kb)
 
@@ -590,15 +686,91 @@ async def admin_add_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_ADMIN_ID
     db.add_admin(new_id, '')
     await update.message.reply_text(
-        f"✅ Пользователь `{new_id}` добавлен как администратор.\n"
-        f"Теперь он может использовать бота.",
+        f"✅ Пользователь `{new_id}` добавлен как администратор.",
         parse_mode='Markdown',
         reply_markup=get_kb(update.effective_user.id),
     )
     return ConversationHandler.END
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# ── VK Chats management ───────────────────────────────────────────────────
+
+def _chats_panel():
+    chats = _load_chats()
+    if not chats:
+        text = "💬 Сохранённых VK чатов нет.\n\nДобавь чат, чтобы выбирать его при создании задачи."
+    else:
+        lines = [f"💬 VK Чаты ({len(chats)} шт.)\n"]
+        for c in chats:
+            lines.append(f"• {c['title']}  (peer_id: {c['peer_id']})")
+        text = '\n'.join(lines)
+    kb = []
+    for c in chats:
+        kb.append([InlineKeyboardButton(f"❌ {c['title']}", callback_data=f"chat_rm:{c['peer_id']}")
+])
+    kb.append([InlineKeyboardButton("➕ Добавить чат", callback_data="chat_add")])
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def vk_chats_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update.effective_user.id):
+        return
+    text, kb = _chats_panel()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def vk_chat_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not check_auth(query.from_user.id):
+        return
+    _remove_chat(int(query.data.split(':')[1]))
+    text, kb = _chats_panel()
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+async def vk_chat_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not check_auth(query.from_user.id):
+        return ConversationHandler.END
+    await query.message.reply_text(
+        "Введи peer_id чата ВК:\n\n"
+        "• Беседа: /convo/4 → 2000000004\n"
+        "• Личка: ID пользователя\n"
+        "• Группа: −ID группы",
+        reply_markup=CANCEL_KB,
+    )
+    return WAIT_CHAT_PEER_ID
+
+
+async def vk_chat_add_peer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data['new_chat_peer_id'] = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ peer_id должен быть числом. Попробуй ещё раз:")
+        return WAIT_CHAT_PEER_ID
+    await update.message.reply_text(
+        "Введи название для этого чата (как его будет видно в меню):\n"
+        "Например: Основная беседа",
+        reply_markup=CANCEL_KB,
+    )
+    return WAIT_CHAT_NAME
+
+
+async def vk_chat_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = update.message.text.strip()
+    peer_id = context.user_data.pop('new_chat_peer_id')
+    _add_chat(peer_id, title)
+    await update.message.reply_text(
+        f"✅ Чат «{title}» сохранён!\n"
+        f"Теперь его можно выбирать при создании задачи.",
+        reply_markup=get_kb(update.effective_user.id),
+    )
+    return ConversationHandler.END
+
+
+# ── MAIN ─────────────────────────────────────────────────────────────────
 
 def main():
     global tg_app
@@ -613,12 +785,16 @@ def main():
             MessageHandler(filters.Regex('^📝 Новая задача$'), add_start),
         ],
         states={
-            WAIT_MESSAGE:      [MessageHandler(text_no_cmd, add_message)],
-            WAIT_PEER_ID:      [MessageHandler(text_no_cmd, add_peer_id)],
-            WAIT_DATETIME:     [MessageHandler(text_no_cmd, add_datetime)],
+            WAIT_MESSAGE:  [MessageHandler(text_no_cmd, add_message)],
+            WAIT_PEER_ID:  [
+                CallbackQueryHandler(add_peer_id_from_chat, pattern='^chat_sel:'),
+                MessageHandler(text_no_cmd, add_peer_id),
+            ],
+            WAIT_DATETIME: [MessageHandler(text_no_cmd, add_datetime)],
             WAIT_REPEAT_CHOICE: [
-                CallbackQueryHandler(add_repeat_choice, pattern='^repeat:'),
-                CallbackQueryHandler(add_weekday,        pattern='^day:'),
+                CallbackQueryHandler(add_repeat_choice,   pattern='^repeat:'),
+                CallbackQueryHandler(add_weekday_toggle,  pattern='^mday:'),
+                CallbackQueryHandler(add_weekday_done,    pattern='^mday_done$'),
             ],
             WAIT_REPEAT_HOURS: [MessageHandler(text_no_cmd, add_repeat_minutes)],
         },
@@ -630,11 +806,22 @@ def main():
     )
 
     admin_conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(admin_add_start, pattern='^admin_add$'),
-        ],
+        entry_points=[CallbackQueryHandler(admin_add_start, pattern='^admin_add$')],
         states={
             WAIT_ADMIN_ID: [MessageHandler(text_no_cmd, admin_add_finish)],
+        },
+        fallbacks=[
+            CommandHandler('start', start),
+            MessageHandler(cancel_filter, cancel_conv),
+        ],
+        per_message=False,
+    )
+
+    vk_chat_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(vk_chat_add_start, pattern='^chat_add$')],
+        states={
+            WAIT_CHAT_PEER_ID: [MessageHandler(text_no_cmd, vk_chat_add_peer_id)],
+            WAIT_CHAT_NAME:    [MessageHandler(text_no_cmd, vk_chat_add_name)],
         },
         fallbacks=[
             CommandHandler('start', start),
@@ -647,26 +834,30 @@ def main():
     tg_app.add_handler(CommandHandler('myid',    my_id))
     tg_app.add_handler(add_conv)
     tg_app.add_handler(admin_conv)
+    tg_app.add_handler(vk_chat_conv)
     tg_app.add_handler(CommandHandler('list',    list_tasks))
     tg_app.add_handler(CommandHandler('delete',  delete_task))
     tg_app.add_handler(CommandHandler('pause',   pause_task))
     tg_app.add_handler(CommandHandler('resume',  resume_task))
     tg_app.add_handler(CommandHandler('admins',  admins_panel))
+    tg_app.add_handler(CommandHandler('chats',   vk_chats_panel))
 
-    # Reply-keyboard button handlers
+    # Reply-keyboard buttons
     tg_app.add_handler(MessageHandler(filters.Regex('^📋 Мои задачи$'),       list_tasks))
     tg_app.add_handler(MessageHandler(filters.Regex('^⏸ Пауза$'),             pause_task))
     tg_app.add_handler(MessageHandler(filters.Regex('^▶️ Возобновить$'),       resume_task))
     tg_app.add_handler(MessageHandler(filters.Regex('^🗑 Удалить задачу$'),    delete_task))
+    tg_app.add_handler(MessageHandler(filters.Regex('^💬 VK Чаты$'),           vk_chats_panel))
     tg_app.add_handler(MessageHandler(filters.Regex('^👥 Администраторы$'),    admins_panel))
 
-    # Inline-button handlers
-    tg_app.add_handler(CallbackQueryHandler(task_pause,    pattern='^task_pause:'))
-    tg_app.add_handler(CallbackQueryHandler(task_resume,   pattern='^task_resume:'))
-    tg_app.add_handler(CallbackQueryHandler(task_del_ask,  pattern='^task_del_ask:'))
-    tg_app.add_handler(CallbackQueryHandler(task_del_yes,  pattern='^task_del_yes:'))
-    tg_app.add_handler(CallbackQueryHandler(task_del_no,   pattern='^task_del_no:'))
-    tg_app.add_handler(CallbackQueryHandler(admin_remove,  pattern='^admin_rm:'))
+    # Inline buttons
+    tg_app.add_handler(CallbackQueryHandler(task_pause,      pattern='^task_pause:'))
+    tg_app.add_handler(CallbackQueryHandler(task_resume,     pattern='^task_resume:'))
+    tg_app.add_handler(CallbackQueryHandler(task_del_ask,    pattern='^task_del_ask:'))
+    tg_app.add_handler(CallbackQueryHandler(task_del_yes,    pattern='^task_del_yes:'))
+    tg_app.add_handler(CallbackQueryHandler(task_del_no,     pattern='^task_del_no:'))
+    tg_app.add_handler(CallbackQueryHandler(admin_remove,    pattern='^admin_rm:'))
+    tg_app.add_handler(CallbackQueryHandler(vk_chat_remove,  pattern='^chat_rm:'))
 
     async def on_startup(app):
         tasks = db.get_all_tasks()
