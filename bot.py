@@ -14,7 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import vk_api
 from database import Database
-from config import TG_TOKEN, VK_TOKEN, ALLOWED_USER_ID
+from config import TG_TOKEN, VK_TOKEN, ALLOWED_USER_ID, WEBHOOK_URL, PORT
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -627,7 +627,17 @@ def main():
         logger.info("Бот запущен!")
 
     tg_app.post_init = on_startup
-    tg_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    if WEBHOOK_URL:
+        tg_app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        tg_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == '__main__':
