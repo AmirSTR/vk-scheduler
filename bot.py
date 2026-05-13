@@ -627,7 +627,7 @@ def main():
         logger.info("Бот запущен!")
 
     tg_app.post_init = on_startup
-    tg_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    tg_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == '__main__':
