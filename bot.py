@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS = range(5)
+WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS, WAIT_DAYS_SELECTION = range(6)
 
 db = Database()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -113,6 +113,14 @@ def schedule_job(task: dict):
             id=job_id, replace_existing=True,
         )
 
+    elif task['repeat_type'] == 'weekly_days':
+        parts = task['repeat_value'].split(':')
+        days_str, hour, minute = parts[0], int(parts[1]), int(parts[2])
+        scheduler.add_job(
+            job_func, CronTrigger(day_of_week=days_str, hour=hour, minute=minute, timezone="Europe/Moscow"),
+            id=job_id, replace_existing=True,
+        )
+
 
 def repeat_label(repeat_type, repeat_value):
     if repeat_type == 'once':
@@ -125,6 +133,11 @@ def repeat_label(repeat_type, repeat_value):
         days = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
         parts = repeat_value.split(':')
         return f'Каждую неделю {days[int(parts[0])]} в {parts[1]}:{parts[2]}'
+    if repeat_type == 'weekly_days':
+        day_names = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+        parts = repeat_value.split(':')
+        labels = ', '.join(day_names[int(d)] for d in parts[0].split(','))
+        return f'По {labels} в {parts[1]}:{parts[2]}'
     return repeat_value
 
 
@@ -151,6 +164,20 @@ def parse_datetime(text: str) -> datetime | None:
         return datetime.strptime(text, '%d.%m.%Y %H:%M')
     except ValueError:
         return None
+
+
+def _days_keyboard(selected: set) -> InlineKeyboardMarkup:
+    names = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    row1 = [
+        InlineKeyboardButton(f"{'✅ ' if i in selected else ''}{names[i]}", callback_data=f"toggle_day:{i}")
+        for i in range(4)
+    ]
+    row2 = [
+        InlineKeyboardButton(f"{'✅ ' if i in selected else ''}{names[i]}", callback_data=f"toggle_day:{i}")
+        for i in range(4, 7)
+    ]
+    done = [InlineKeyboardButton("✅ Готово", callback_data="days_done")]
+    return InlineKeyboardMarkup([row1, row2, done])
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -272,6 +299,7 @@ async def add_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔁 Каждые N минут",           callback_data="repeat:interval")],
         [InlineKeyboardButton("📅 Каждый день в это время",  callback_data="repeat:daily")],
         [InlineKeyboardButton("📆 Раз в неделю",             callback_data="repeat:weekly")],
+        [InlineKeyboardButton("🗓 Выбрать дни недели",       callback_data="repeat:weekly_days")],
     ]
     await update.message.reply_text("🔄 Выбери режим повтора:", reply_markup=InlineKeyboardMarkup(keyboard))
     return WAIT_REPEAT_CHOICE
@@ -309,6 +337,14 @@ async def add_repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Выбери день недели:", reply_markup=InlineKeyboardMarkup(days_kb))
         return WAIT_REPEAT_CHOICE
 
+    if repeat_type == 'weekly_days':
+        context.user_data['selected_days'] = set()
+        await query.edit_message_text(
+            "🗓 Выбери дни недели (можно несколько), затем нажми «Готово»:",
+            reply_markup=_days_keyboard(set()),
+        )
+        return WAIT_DAYS_SELECTION
+
 
 async def add_repeat_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -328,6 +364,33 @@ async def add_weekday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day = query.data.split(':')[1]
     dt = datetime.fromisoformat(context.user_data['next_run'])
     await _save_task_from_query(query, context, 'weekly', f"{day}:{dt.hour:02d}:{dt.minute:02d}")
+    return ConversationHandler.END
+
+
+async def toggle_day_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    day = int(query.data.split(':')[1])
+    selected: set = context.user_data.setdefault('selected_days', set())
+    if day in selected:
+        selected.discard(day)
+    else:
+        selected.add(day)
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=_days_keyboard(selected))
+    return WAIT_DAYS_SELECTION
+
+
+async def days_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    selected: set = context.user_data.get('selected_days', set())
+    if not selected:
+        await query.answer("⚠️ Выбери хотя бы один день!", show_alert=True)
+        return WAIT_DAYS_SELECTION
+    await query.answer()
+    dt = datetime.fromisoformat(context.user_data['next_run'])
+    days_str = ','.join(str(d) for d in sorted(selected))
+    repeat_value = f"{days_str}:{dt.hour:02d}:{dt.minute:02d}"
+    await _save_task_from_query(query, context, 'weekly_days', repeat_value)
     return ConversationHandler.END
 
 
@@ -520,6 +583,10 @@ def main():
                 CallbackQueryHandler(add_weekday,        pattern='^day:'),
             ],
             WAIT_REPEAT_HOURS: [MessageHandler(text_no_cmd, add_repeat_minutes)],
+            WAIT_DAYS_SELECTION: [
+                CallbackQueryHandler(toggle_day_selection, pattern='^toggle_day:'),
+                CallbackQueryHandler(days_done_handler,    pattern='^days_done$'),
+            ],
         },
         fallbacks=[
             CommandHandler('start', start),
